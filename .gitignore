@@ -13,7 +13,16 @@ dist/
 # 便携模式数据目录（settings.ini / place.log / dxgi.log / 留帧 frames/ /
 # 扫描日志 scan.log）。开发态生成在项目根，打包态生成在 EXE 旁边，
 # 两处都会被这条规则盖住。里面是本机屏幕截图，更不该进公共仓库。
+# 下一行是 v4.0.0 改名前的旧数据目录名，老 EXE 在项目根跑过会留下，一并忽略。
 PUBG-MapRuler-Data/
+PUBGMapOverlayEx-Data/
+
+# --- 识别回归测试集 ---------------------------------------------------------
+# testset/ 存本机留帧副本：不同缩放档、不同队伍色、叠标/遮挡等难样本，
+# 每个样本都带 expected.json 里的期望槽位与距离。每次改识别链路后跑
+# `python tools/testset_eval.py` 对账。截图是本机数据，不入公共仓库。
+# 规则见 docs/design.md「测试集与回归」。
+testset/
 
 # --- Oodle 测试语料 ---------------------------------------------------------
 # vendor/ooz/ooz-src 是上游 ooz 的源码副本（pak 解包参考），官方测试语料
@@ -46,3 +55,10 @@ desktop.ini
 *.log
 *.pid
 *.bak
+
+# ZCode 在本项目里开的会话工作目录
+.zcode/
+
+# --- 临时目录 / 散落临时文件（诊断产物，用完即删）---
+.tmp/
+.tmp_*

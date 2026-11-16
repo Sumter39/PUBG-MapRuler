@@ -519,13 +519,14 @@ PUBG-MapRuler/
 │   ├── testset_eval.py           识别回归测试集对账（改完链路必跑）
 │   └── zoom_batch.py             对任意帧目录批量量 px/100m（不需要 expected.json）
 ├── testset/                      识别回归测试集（Git 忽略，按文档规则重建）
-├── vendor/                       第三方，原样存放
+├── vendor/                       第三方，本地自备（不入库）
 │   ├── ooz/                      oo2core_9 DLL + 上游源码副本
 │   └── unpaker/                  Unpaker.CLI pak 工具套件
 └── dist/                         构建产物（不入库）
 ```
 
-划分原则：`tools/` 只放自研，`vendor/` 只放第三方。
+划分原则：`tools/` 只放自研，`vendor/` 只放第三方；两者涉及专有许可与
+本机工具，一律不入公共仓库。
 
 ## 数据来源
 

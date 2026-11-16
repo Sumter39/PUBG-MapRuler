@@ -37,10 +37,19 @@ VT_ENUM_ADAPTERS = 7
 VT_ENUM_OUTPUTS = 7
 VT_OUTPUT_GETDESC = 7
 VT_DUPLICATE_OUTPUT = 22
+# IDXGIOutput5::DuplicateOutput1。它能在 HDR 桌面上**显式索取 FP16**，
+# 这是拿到未截断 HDR 数据的唯一途径（v4.0.10）。
+#
+# 注意：这台机器上 QI 到 IDXGIOutput5 返回 E_NOINTERFACE（Output3~6 全部如此，
+# 但 IDXGIFactory6 / IDXGIAdapter4 又是可用的），所以没法按文档拿接口指针。
+# 实测该对象**确实实现了这个方法**，只是不响应 QI——直接按槽位调用成功。
+# 槽位 26 是 IDXGIOutput 继承链算出来的：DuplicateOutput=22 之后依次
+# GetDisplayModeList1/FindClosestMatchingMode1/GetDisplaySurfaceData1(25)、
+# SupportsOverlays、CheckOverlaySupport、CheckOverlayColorSpaceSupport、DuplicateOutput1。
+VT_DUPLICATE_OUTPUT1 = 26
 VT_ACQUIRE_NEXT_FRAME = 8
 VT_RELEASE_FRAME = 14
 VT_CREATE_TEXTURE2D = 5
-VT_GET_IMMEDIATE_CONTEXT = 40
 VT_TEX_GETDESC = 10
 VT_COPY_RESOURCE = 47
 VT_MAP = 14
@@ -183,6 +192,49 @@ def _release(ptr):
             pass
 
 
+# DXGI_FORMAT：10 = R16G16B16A16_FLOAT（scRGB HDR），87 = B8G8R8A8_UNORM
+FORMAT_FP16 = 10
+FORMAT_BGRA8 = 87
+
+_MOD_RANGE = {}
+
+
+def _module_range(name):
+    """取已加载模块的 [基址, 基址+映像大小)，用于判断函数指针来源。"""
+    r = _MOD_RANGE.get(name)
+    if r is None:
+        k32 = ctypes.windll.kernel32
+        k32.GetModuleHandleW.restype = ctypes.c_void_p
+        base = k32.GetModuleHandleW(name)
+        if not base:
+            return (0, 0)
+        lfanew = ctypes.c_uint32.from_address(base + 0x3C).value
+        size = ctypes.c_uint32.from_address(base + lfanew + 24 + 56).value
+        r = (base, base + size)
+        _MOD_RANGE[name] = r
+    return r
+
+
+def _vt_slot_ok(ptr, idx):
+    """槽位是否指向 dxgi.dll 内部。
+
+    DuplicateOutput1 在本机不响应 QI（IDXGIOutput5 返回 E_NOINTERFACE），
+    只能按槽位直接调；先确认该槽位确实是 DXGI 的实现，避免在缺少该接口的
+    老系统上跳到随机地址把进程打崩。
+    """
+    try:
+        vt = ctypes.cast(ctypes.c_void_p(ptr),
+                         ctypes.POINTER(ctypes.c_void_p)).contents.value
+        if not vt:
+            return False
+        fn = ctypes.cast(ctypes.c_void_p(vt),
+                         ctypes.POINTER(ctypes.c_void_p))[idx]
+        lo, hi = _module_range('dxgi.dll')
+        return bool(fn) and lo <= fn < hi
+    except Exception:
+        return False
+
+
 def _log(msg):
     """诊断日志 → 数据目录 dxgi.log（便携模式，随 EXE 同文件夹；失败静默）。"""
     try:
@@ -275,7 +327,7 @@ def grab_full(crop=None):
         from PIL import Image
     except Exception:
         return None
-    factory = adapter = output = out1 = dev = ctx = dup = tex = stag = res = None
+    factory = adapter = output = out1 = dev = ctx = dup = tex = stag = None
     try:
         dxgi = ctypes.WinDLL('dxgi')
         d3d11 = ctypes.WinDLL('d3d11')
@@ -342,29 +394,50 @@ def grab_full(crop=None):
         ctx = c.value
 
         out1_ptr = ctypes.c_void_p(_qi(output, IID_IDXGIOutput1))
-        _release(output)
-        output = None
         out1 = out1_ptr.value
 
+        # 优先用 DuplicateOutput1 显式要 FP16（HDR 屏上唯一不丢高光的路径）。
+        # 老接口 DuplicateOutput 在 HDR 桌面上会把 HDR 缓冲压成 8 位 SDR，
+        # 实测整体被乘约 2 倍、160 以上全撞成纯白——这就是「截图过曝」。
         dup_p = ctypes.c_void_p()
-        hr = _method(out1, VT_DUPLICATE_OUTPUT, ctypes.HRESULT,
-                     ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))(
-            out1, dev, ctypes.byref(dup_p))
-        if hr != 0:
-            return _fail('DuplicateOutput', hr)
-        dup = dup_p.value
+        dup = None
+        if _vt_slot_ok(out1, VT_DUPLICATE_OUTPUT1):
+            fmts = (ctypes.c_uint * 2)(FORMAT_FP16, FORMAT_BGRA8)
+            hr = _method(out1, VT_DUPLICATE_OUTPUT1, ctypes.HRESULT,
+                         ctypes.c_void_p, wintypes.UINT, wintypes.UINT,
+                         ctypes.POINTER(ctypes.c_uint),
+                         ctypes.POINTER(ctypes.c_void_p))(
+                out1, dev, 0, 2, fmts, ctypes.byref(dup_p))
+            if hr == 0 and dup_p.value:
+                dup = dup_p.value
+        if dup is None:                     # 退回老接口（非 HDR 桌面够用）
+            dup_p = ctypes.c_void_p()
+            hr = _method(out1, VT_DUPLICATE_OUTPUT, ctypes.HRESULT,
+                         ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))(
+                out1, dev, ctypes.byref(dup_p))
+            if hr != 0:
+                return _fail('DuplicateOutput', hr)
+            dup = dup_p.value
 
-        # 等一帧新画面并拷贝读回。HDR/独占切换瞬间桌面复制可能给「全黑帧」
-        # （v3.9.16 实测：HDR 下 FP16 帧全黑 → 上层误报无轨迹）。黑帧丢弃
-        # 重试，连续 3 帧仍黑则失败返回 None，让上层走 GDI 兜底。
+        # 等一帧新画面并拷贝读回。
+        #
+        # HDR 桌面上，同一个会话里帧格式**会在 FP16 和 SDR 之间跳**：实测序列
+        # 是 10(全黑) → 87 → 10 → 10。旧版拿到第 1 帧的 87 就当成成功，
+        # 而 87 是 DWM 拿 80 nit 参考白把 HDR 缓冲直接截断出来的 SDR 帧——
+        # 亮部（雪地、浅色地形、地图建筑白线）整片削成纯白，这就是「截图
+        # 过曝」的真正来源，跟后处理无关。
+        #
+        # 现在的策略：优先要 FP16（scRGB 原始值，由 _tonemap_fp16 按真实
+        # SDR 白电平归一化，不削顶），SDR 帧只作兜底；两者都没有才算失败。
         WAIT_TIMEOUT = 0x887A0027
         raw = None
         stride = 0
         fmt = 0
         w = h = 0
+        fallback = None            # 非黑 SDR 帧，留到确实拿不到 FP16 时用
         stag = None
         stag_key = None
-        for _attempt in range(3):
+        for _attempt in range(6):
             info = FRAME_INFO()
             rsrc = ctypes.c_void_p()
             got = False
@@ -434,12 +507,18 @@ def grab_full(crop=None):
             if _frame_black(raw, mp.RowPitch, w, h, td.Format):
                 raw = None                         # 黑帧：丢弃，重试下一帧
                 continue
-            stride = mp.RowPitch
-            fmt = td.Format
-            break
+            if td.Format == 10:                    # HDR 原始帧，优先采用
+                stride = mp.RowPitch
+                fmt = td.Format
+                break
+            if fallback is None:                   # SDR：记下，继续找 FP16
+                fallback = (raw, mp.RowPitch, td.Format, w, h)
+            raw = None
 
         if raw is None:
-            return _fail('black-frame x3')
+            if fallback is None:
+                return _fail('no-usable-frame x6')
+            raw, stride, fmt, w, h = fallback
 
         if fmt == 10:                # R16G16B16A16_FLOAT —— HDR 原始帧
             return _tonemap_fp16(np, Image, raw, stride, w, h, crop, fmt)
@@ -468,7 +547,7 @@ def grab_full(crop=None):
         return _fail('exc:%r @%s:%d' % (e, os.path.basename(loc.filename),
                                         loc.lineno))
     finally:
-        for p in (stag, tex, dup, out1, ctx, dev, adapter, factory):
+        for p in (stag, tex, dup, out1, output, ctx, dev, adapter, factory):
             _release(p)
 
 
@@ -529,7 +608,18 @@ def _tonemap_fp16(np, Image, raw, stride, w, h, crop, fmt=10):
     nits, src = _sdr_white_nits()
     _log_frame(fmt, nits)
     white_n = nits / 80.0
-    norm = np.clip(vals / white_n, 0.0, 1.0) ** (1.0 / 2.2)
+    x = vals / white_n                      # 1.0 = SDR 白电平（240 nit）
+    # HDR 高光不能直接 clip：实测这局画面里逆光可达 1000 nit（x≈4.3），
+    # 硬切会把整片高光压成纯白（门口 51% 撞顶、看不出远处树林）。改成软肩：
+    #   x ≤ KNEE  线性不变 —— SDR 内容（地图界面、UI）一个像素都不动
+    #   x > KNEE  指数滚降，x→∞ 逼近 1.0，高光保留层次而不是一刀切平
+    KNEE, SOFT = 0.75, 1.5
+    y = x
+    hi = x > KNEE
+    if hi.any():
+        y = x.copy()
+        y[hi] = KNEE + (1.0 - KNEE) * (1.0 - np.exp(-(x[hi] - KNEE) / SOFT))
+    norm = np.clip(y, 0.0, 1.0) ** (1.0 / 2.2)
     out = (norm * 255.0 + 0.5).astype(np.uint8)
     return Image.frombuffer('RGB', (x1 - x0, y1 - y0),
                             out.tobytes(), 'raw', 'RGB', 0, 1)
